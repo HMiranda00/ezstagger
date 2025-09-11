@@ -17,6 +17,8 @@ from bpy.props import BoolProperty, EnumProperty
 
 
 ADDON_KEYMAP_ITEMS = []
+MSGBUS_OWNER = object()
+SELECTION_HISTORY: list[str] = []
 
 
 def _parse_bone_name_from_datapath(data_path: str) -> str | None:
@@ -98,6 +100,23 @@ def _gather_relevant_actions(context):
     for act in bpy.data.actions:
         if act not in yielded:
             yield act
+
+
+def _on_active_object_change():
+    # Track selection order by active object history
+    try:
+        vlayer = bpy.context.view_layer
+        obj = vlayer.objects.active if vlayer else None
+        if obj is None:
+            return
+        name = obj.name
+        try:
+            SELECTION_HISTORY.remove(name)
+        except ValueError:
+            pass
+        SELECTION_HISTORY.append(name)
+    except Exception:
+        pass
 
 
 class EZSTAGGER_Preferences(AddonPreferences):
@@ -279,16 +298,26 @@ class EZSTAGGER_OT_stagger_modal(Operator):
                 return min(k.orig_co_x for k in items)
             groups_sorted = sorted(group_items.keys(), key=lambda k: earliest_time(group_items[k]))
         else:
-            # Outliner-like: owner name, bone name, datapath, array_index
-            def outliner_key(k):
-                owner_name, bone_name, data_path, array_index = k
+            # Default: selection order of objects in viewport, fallback to Outliner index
+            sel_rank = _build_selection_order_map(context)
+            outline_rank = _build_outliner_order_map(context)
+
+            def group_sort_key(k):
+                items = group_items[k]
+                ref = items[0]
+                obj = ref.owner_obj
+                sr = sel_rank.get(obj, 10**9)
+                orank = outline_rank.get(obj, 10**9)
                 return (
-                    owner_name or "",
-                    bone_name or "",
-                    data_path or "",
-                    array_index if array_index is not None else -1,
+                    sr,
+                    orank,
+                    ref.owner_name or "",
+                    ref.bone_name or "",
+                    ref.data_path or "",
+                    ref.array_index if ref.array_index is not None else -1,
                 )
-            groups_sorted = sorted(group_items.keys(), key=outliner_key)
+
+            groups_sorted = sorted(group_items.keys(), key=group_sort_key)
 
         self._groups = groups_sorted
         self._group_items = group_items
@@ -380,6 +409,57 @@ def _prefs() -> EZSTAGGER_Preferences:
     return addon_prefs.preferences
 
 
+def _build_selection_order_map(context) -> dict:
+    """Map objects to ranks using live selection history; fallback to current selected order.
+
+    The most recently active object gets the highest priority (largest index in history),
+    but we map to increasing rank (0 is first) preserving history order.
+    """
+    mapping = {}
+    # Use selection history if available
+    if SELECTION_HISTORY:
+        for i, name in enumerate(SELECTION_HISTORY):
+            obj = bpy.data.objects.get(name)
+            if obj is not None and obj not in mapping:
+                mapping[obj] = i
+    # Fallback to current selected objects order
+    if not mapping and getattr(context, 'selected_objects', None):
+        for i, obj in enumerate(context.selected_objects):
+            mapping[obj] = i
+    return mapping
+
+
+def _build_outliner_order_map(context) -> dict:
+    """Map objects to a stable index following the View Layer Outliner order.
+
+    We traverse the layer_collection tree depth-first and enumerate collection.objects
+    in their stored order, matching the Outliner order as closely as possible.
+    """
+    mapping = {}
+    counter = [0]
+
+    def visit_layer(layer):
+        col = layer.collection
+        for obj in col.objects:
+            if obj not in mapping:
+                mapping[obj] = counter[0]
+                counter[0] += 1
+        for child in layer.children:
+            visit_layer(child)
+
+    view_layer = context.view_layer if getattr(context, 'view_layer', None) else None
+    if view_layer:
+        visit_layer(view_layer.layer_collection)
+    else:
+        # Fallback to scene collection
+        root = context.scene.collection if getattr(context, 'scene', None) else None
+        if root:
+            for obj in root.all_objects:
+                mapping[obj] = counter[0]
+                counter[0] += 1
+    return mapping
+
+
 classes = (
     EZSTAGGER_Preferences,
     EZSTAGGER_OT_stagger_modal,
@@ -398,6 +478,26 @@ def register():
         kmi = km.keymap_items.new(EZSTAGGER_OT_stagger_modal.bl_idname, type='LEFTMOUSE', value='PRESS', alt=True)
         ADDON_KEYMAP_ITEMS.append((km, kmi))
 
+    # Subscribe to active object changes to record selection history
+    try:
+        bpy.msgbus.subscribe_rna(
+            key=(bpy.types.LayerObjects, "active"),
+            owner=MSGBUS_OWNER,
+            args=(),
+            notify=lambda: _on_active_object_change(),
+        )
+    except Exception:
+        # Fallback for API changes
+        try:
+            bpy.msgbus.subscribe_rna(
+                key=(bpy.types.ViewLayer, "objects.active"),
+                owner=MSGBUS_OWNER,
+                args=(),
+                notify=lambda: _on_active_object_change(),
+            )
+        except Exception:
+            pass
+
 
 def unregister():
     # Remove keymaps
@@ -413,6 +513,12 @@ def unregister():
 
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
+
+    # Unsubscribe msgbus
+    try:
+        bpy.msgbus.clear_by_owner(MSGBUS_OWNER)
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
