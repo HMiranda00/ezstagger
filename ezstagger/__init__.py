@@ -1,20 +1,47 @@
-"""EZ Stagger Offset - Alt-drag to apply staggered per-channel frame offsets."""
+"""EZ Stagger Offset - Visual gizmo-based stagger tool for keyframe animation."""
 
 import bpy
 import blf
+import gpu
+import random
+import math
+from gpu_extras.batch import batch_for_shader
 from bpy.types import Operator, AddonPreferences
-from bpy.props import BoolProperty, EnumProperty
+from bpy.props import BoolProperty, EnumProperty, IntProperty
 
 
-ADDON_KEYMAP_ITEMS = []
-MSGBUS_OWNER = object()
-SELECTION_HISTORY: list[str] = []
+# -----------------------------------------------------------------------------
+# Global State
+# -----------------------------------------------------------------------------
 
+class StaggerWidgetState:
+    """Stores the state for the stagger gizmo overlay"""
+    _instance = None
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance.draw_handlers = {}
+            cls._instance.enabled = True
+            cls._instance.hovered = None  # "NORMAL", "REVERSE", "RANDOM" or None
+            cls._instance.random_seed = 42
+            cls._instance.gizmo_positions = []  # [(x, y, mode), ...]
+            cls._instance.has_selection = False
+            cls._instance.bbox = None
+        return cls._instance
+
+
+state = StaggerWidgetState()
+addon_keymaps = []
+
+
+# -----------------------------------------------------------------------------
+# Utility Functions
+# -----------------------------------------------------------------------------
 
 def _parse_bone_name_from_datapath(data_path: str) -> str | None:
     if not data_path:
         return None
-    # Robust, regex-free parsing: pose.bones["BoneName"]
     prefix = 'pose.bones["'
     start = data_path.find(prefix)
     if start == -1:
@@ -27,11 +54,7 @@ def _parse_bone_name_from_datapath(data_path: str) -> str | None:
 
 
 def _get_fcurves_from_action(action):
-    """Get all fcurves from action (Blender 5.0+ slotted actions API).
-    
-    In Blender 5.0+, fcurves are accessed through layers/strips/channelbags
-    instead of directly from the Action object.
-    """
+    """Get all fcurves from action (Blender 5.0+ slotted actions API)."""
     fcurves = []
     if not hasattr(action, 'layers') or not action.layers:
         return fcurves
@@ -49,209 +72,552 @@ def _get_fcurves_from_action(action):
 
 
 def _action_owners_map() -> dict:
-    """Build a mapping from Action datablocks to owning Objects.
-
-    Note: An Action can theoretically be used by multiple owners. In such cases,
-    we keep the first encountered owner per Action.
-    """
+    """Build a mapping from Action datablocks to owning Objects."""
     owners: dict = {}
-    # Prefer objects in the active view layer for performance & relevance
-    for obj in bpy.context.view_layer.objects:
-        ad = getattr(obj, "animation_data", None)
-        if not ad:
-            continue
-        act = getattr(ad, "action", None)
-        if act and act not in owners:
-            owners[act] = obj
-        # Also consider NLA strips that reference actions
-        if getattr(ad, "nla_tracks", None):
-            for track in ad.nla_tracks:
-                for strip in track.strips:
-                    act = getattr(strip, "action", None)
-                    if act and act not in owners:
-                        owners[act] = obj
+    try:
+        for obj in bpy.context.view_layer.objects:
+            ad = getattr(obj, "animation_data", None)
+            if not ad:
+                continue
+            act = getattr(ad, "action", None)
+            if act and act not in owners:
+                owners[act] = obj
+            if getattr(ad, "nla_tracks", None):
+                for track in ad.nla_tracks:
+                    for strip in track.strips:
+                        act = getattr(strip, "action", None)
+                        if act and act not in owners:
+                            owners[act] = obj
+    except:
+        pass
     return owners
 
 
 def _gather_relevant_actions(context):
-    """Yield actions relevant to the current Dope Sheet/Action Editor context.
-
-    Priority:
-    - If the current Dope Sheet is in Action Editor mode, use the displayed action.
-    - Otherwise, collect actions from selected objects' animation_data (active action and NLA strip actions).
-    - As a fallback, iterate all actions (may include unused datablocks).
-    """
+    """Yield actions relevant to the current Dope Sheet/Action Editor context."""
     yielded = set()
-    area = context.area
-    if area and area.type == 'DOPESHEET_EDITOR':
-        space = context.space_data
-        if getattr(space, 'mode', 'DOPESHEET') == 'ACTION':
-            action = getattr(space, 'action', None)
-            if action:
-                yielded.add(action)
-                yield action
-
-    # Selected objects' actions
-    for obj in context.selected_objects or []:
-        ad = getattr(obj, 'animation_data', None)
-        if not ad:
-            continue
-        act = getattr(ad, 'action', None)
-        if act and act not in yielded:
-            yielded.add(act)
-            yield act
-        if getattr(ad, 'nla_tracks', None):
-            for track in ad.nla_tracks:
-                for strip in track.strips:
-                    act = getattr(strip, 'action', None)
-                    if act and act not in yielded:
-                        yielded.add(act)
-                        yield act
-
-    # Fallback: all actions
-    for act in bpy.data.actions:
-        if act not in yielded:
-            yield act
-
-
-def _on_active_object_change():
-    # Track selection order by active object history
     try:
-        vlayer = bpy.context.view_layer
-        obj = vlayer.objects.active if vlayer else None
-        if obj is None:
-            return
-        name = obj.name
-        try:
-            SELECTION_HISTORY.remove(name)
-        except ValueError:
-            pass
-        SELECTION_HISTORY.append(name)
-    except Exception:
+        area = context.area
+        if area and area.type == 'DOPESHEET_EDITOR':
+            space = context.space_data
+            if getattr(space, 'mode', 'DOPESHEET') == 'ACTION':
+                action = getattr(space, 'action', None)
+                if action:
+                    yielded.add(action)
+                    yield action
+
+        for obj in context.selected_objects or []:
+            ad = getattr(obj, 'animation_data', None)
+            if not ad:
+                continue
+            act = getattr(ad, 'action', None)
+            if act and act not in yielded:
+                yielded.add(act)
+                yield act
+            if getattr(ad, 'nla_tracks', None):
+                for track in ad.nla_tracks:
+                    for strip in track.strips:
+                        act = getattr(strip, 'action', None)
+                        if act and act not in yielded:
+                            yielded.add(act)
+                            yield act
+
+        for act in bpy.data.actions:
+            if act not in yielded:
+                yield act
+    except:
         pass
 
 
-class EZSTAGGER_Preferences(AddonPreferences):
-    bl_idname = "ezstagger"
+# -----------------------------------------------------------------------------
+# Selection Detection
+# -----------------------------------------------------------------------------
 
-    order_mode: EnumProperty(
-        name="Default Order",
-        description="Default ordering of channels for the stair offset",
-        items=(
-            ("OUTLINER", "Outliner-like", "Order by owner name, then bone, then path"),
-            ("TIME", "Selection-like (Earliest)", "Order by each channel's earliest selected keyframe time"),
-        ),
-        default="OUTLINER",
-    )
+def _get_selected_keyframes_bbox():
+    """Get bounding box of selected keyframes and count groups.
+    Returns (bbox, num_groups) or (None, 0)."""
+    context = bpy.context
+    
+    if not context.area or context.area.type != 'DOPESHEET_EDITOR':
+        return None, 0
+    
+    region = context.region
+    if not region:
+        return None, 0
+    
+    v2d = region.view2d
+    
+    min_frame = float('inf')
+    max_frame = float('-inf')
+    channels_with_selection = set()  # Track unique channels
+    
+    for act in _gather_relevant_actions(context):
+        fcurves = _get_fcurves_from_action(act)
+        if not fcurves:
+            continue
+        for fc in fcurves:
+            for kp in fc.keyframe_points:
+                if getattr(kp, "select_control_point", False):
+                    frame = kp.co.x
+                    if frame < min_frame:
+                        min_frame = frame
+                    if frame > max_frame:
+                        max_frame = frame
+                    # Track this channel as having selection
+                    channels_with_selection.add((id(act), id(fc)))
+    
+    num_groups = len(channels_with_selection)
+    
+    if num_groups == 0:
+        return None, 0
+    
+    # Convert to region coordinates
+    x1, _ = v2d.view_to_region(min_frame, 0, clip=False)
+    x2, _ = v2d.view_to_region(max_frame, 0, clip=False)
+    
+    # Y bounds - use region center
+    y_center = region.height / 2
+    y_extent = 30
+    y1 = y_center - y_extent
+    y2 = y_center + y_extent
+    
+    return (x1 - 10, x2 + 10, y1, y2), num_groups
 
-    auto_grouping: BoolProperty(
-        name="Auto Grouping (per FCurve vs per Owner)",
-        description=(
-            "Attempt to auto-detect grouping level: if any F-Curve channel header is selected,"
-            " group per F-Curve; otherwise group per Object/Bone"
-        ),
-        default=True,
-    )
 
-    def draw(self, context):
-        layout = self.layout
-        layout.label(text="EZ Stagger Offset")
-        layout.prop(self, "order_mode")
-        layout.prop(self, "auto_grouping")
+# -----------------------------------------------------------------------------
+# Drawing Functions
+# -----------------------------------------------------------------------------
 
-
-def _draw_stagger_callback(self, context):
-    """Draw callback to show stagger offset feedback during modal operation."""
-    if self._last_applied_delta is None:
+def _draw_rounded_rect(shader, x, y, width, height, color, radius=4):
+    """Draw a filled rectangle with rounded corners."""
+    radius = min(radius, width / 2, height / 2)
+    
+    if radius <= 1:
+        vertices = [(x, y), (x + width, y), (x + width, y + height), (x, y + height)]
+        indices = [(0, 1, 2), (0, 2, 3)]
+        batch = batch_for_shader(shader, 'TRIS', {"pos": vertices}, indices=indices)
+        shader.uniform_float("color", color)
+        batch.draw(shader)
         return
     
-    # Get mouse position for drawing near cursor
-    x = self._draw_mouse_x
-    y = self._draw_mouse_y
+    vertices = []
+    segments = 4
     
-    # Configure text
+    corners = [
+        (x + radius, y + radius, math.pi, 1.5 * math.pi),
+        (x + width - radius, y + radius, 1.5 * math.pi, 2 * math.pi),
+        (x + width - radius, y + height - radius, 0, 0.5 * math.pi),
+        (x + radius, y + height - radius, 0.5 * math.pi, math.pi),
+    ]
+    
+    for cx, cy, start_angle, end_angle in corners:
+        for i in range(segments + 1):
+            t = i / segments
+            angle = start_angle + t * (end_angle - start_angle)
+            vx = cx + radius * math.cos(angle)
+            vy = cy + radius * math.sin(angle)
+            vertices.append((vx, vy))
+    
+    center = (x + width / 2, y + height / 2)
+    vertices.insert(0, center)
+    
+    indices = []
+    num_verts = len(vertices)
+    for i in range(1, num_verts - 1):
+        indices.append((0, i, i + 1))
+    indices.append((0, num_verts - 1, 1))
+    
+    batch = batch_for_shader(shader, 'TRIS', {"pos": vertices}, indices=indices)
+    shader.uniform_float("color", color)
+    batch.draw(shader)
+
+
+def _draw_circle(shader, x, y, radius, color, segments=16):
+    """Draw a filled circle."""
+    vertices = [(x, y)]
+    for i in range(segments + 1):
+        angle = 2 * math.pi * i / segments
+        vertices.append((x + radius * math.cos(angle), y + radius * math.sin(angle)))
+    
+    indices = [(0, i + 1, (i + 1) % segments + 1) for i in range(segments)]
+    
+    batch = batch_for_shader(shader, 'TRIS', {"pos": vertices}, indices=indices)
+    shader.uniform_float("color", color)
+    batch.draw(shader)
+
+
+def _draw_circle_outline(shader, x, y, radius, color, width=2, segments=24):
+    """Draw a circle outline."""
+    vertices = []
+    for i in range(segments + 1):
+        angle = 2 * math.pi * i / segments
+        vertices.append((x + radius * math.cos(angle), y + radius * math.sin(angle)))
+    
+    batch = batch_for_shader(shader, 'LINE_STRIP', {"pos": vertices})
+    shader.uniform_float("color", color)
+    gpu.state.line_width_set(width)
+    batch.draw(shader)
+    gpu.state.line_width_set(1.0)
+
+
+def _brighten_color(color, factor=0.15):
+    """Brighten a color for hover states."""
+    return tuple(min(1.0, c + factor) for c in color[:3]) + (min(1.0, color[3] + 0.1),)
+
+
+def draw_stagger_gizmos():
+    """Main draw callback for stagger gizmos."""
+    context = bpy.context
+    
+    if context is None:
+        return
+    
+    if not state.enabled:
+        return
+    
+    if context.area is None or context.area.type != 'DOPESHEET_EDITOR':
+        return
+    
+    region = context.region
+    if region is None:
+        return
+    
+    # Get selection bounding box and group count
+    bbox, num_groups = _get_selected_keyframes_bbox()
+    
+    # Only show gizmos if more than 2 groups selected
+    if bbox is None or num_groups < 2:
+        state.has_selection = False
+        state.gizmo_positions = []
+        return
+    
+    state.has_selection = True
+    state.bbox = bbox
+    
+    x1, x2, y1, y2 = bbox
+    
+    # Position gizmos to the right of selection
+    center_x = x2 + 20
+    gizmo_radius = 7
+    spacing = 20
+    
+    mid_y = (y1 + y2) / 2
+    top_y = mid_y + spacing
+    bot_y = mid_y - spacing
+    
+    gizmo_positions = [
+        (center_x, top_y, "REVERSE"),
+        (center_x, mid_y, "RANDOM"),
+        (center_x, bot_y, "NORMAL"),
+    ]
+    state.gizmo_positions = gizmo_positions
+    
+    # Colors
+    col_normal = (0.35, 0.75, 0.45, 0.95)
+    col_reverse = (0.75, 0.45, 0.35, 0.95)
+    col_random = (0.55, 0.45, 0.75, 0.95)
+    col_line = (0.4, 0.4, 0.4, 0.6)
+    col_hover_outline = (1.0, 1.0, 1.0, 1.0)
+    
+    # Setup GPU
+    gpu.state.blend_set('ALPHA')
+    shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+    shader.bind()
+    
+    # Draw connecting line
+    line_verts = [(center_x, bot_y), (center_x, top_y)]
+    batch = batch_for_shader(shader, 'LINES', {"pos": line_verts})
+    shader.uniform_float("color", col_line)
+    gpu.state.line_width_set(2)
+    batch.draw(shader)
+    gpu.state.line_width_set(1)
+    
+    # Draw each gizmo
+    for gx, gy, mode in gizmo_positions:
+        if mode == "NORMAL":
+            color = col_normal
+            label = "▼"
+        elif mode == "REVERSE":
+            color = col_reverse
+            label = "▲"
+        else:
+            color = col_random
+            label = "◆"
+        
+        # Brighten if hovered
+        if state.hovered == mode:
+            color = _brighten_color(color, 0.2)
+        
+        # Draw filled circle
+        _draw_circle(shader, gx, gy, gizmo_radius, color)
+        
+        # Draw hover outline
+        if state.hovered == mode:
+            _draw_circle_outline(shader, gx, gy, gizmo_radius + 2, col_hover_outline, 2)
+        
+        # Draw label
+        font_id = 0
+        blf.size(font_id, 9)
+        blf.color(font_id, 1.0, 1.0, 1.0, 1.0)
+        dim = blf.dimensions(font_id, label)
+        blf.position(font_id, gx - dim[0] / 2, gy - dim[1] / 2 + 1, 0)
+        blf.draw(font_id, label)
+    
+    gpu.state.blend_set('NONE')
+    
+    # Draw tooltip for hovered gizmo
+    if state.hovered:
+        gpu.state.blend_set('ALPHA')
+        shader.bind()
+        
+        tooltips = {
+            "NORMAL": "Top → Bottom",
+            "REVERSE": "Bottom → Top",
+            "RANDOM": f"Random (seed {state.random_seed})",
+        }
+        tooltip = tooltips.get(state.hovered, "")
+        
+        for gx, gy, mode in gizmo_positions:
+            if mode == state.hovered:
+                # Draw tooltip background
+                font_id = 0
+                blf.size(font_id, 11)
+                dim = blf.dimensions(font_id, tooltip)
+                padding = 5
+                box_x = gx + 18
+                box_y = gy - dim[1] / 2 - padding
+                box_w = dim[0] + padding * 2
+                box_h = dim[1] + padding * 2
+                
+                _draw_rounded_rect(shader, box_x, box_y, box_w, box_h, (0.1, 0.1, 0.1, 0.9), 3)
+                
+                # Draw tooltip text
+                blf.color(font_id, 0.9, 0.9, 0.9, 1.0)
+                blf.position(font_id, box_x + padding, gy - dim[1] / 2, 0)
+                blf.draw(font_id, tooltip)
+                break
+        
+        gpu.state.blend_set('NONE')
+
+
+def _draw_stagger_feedback(operator, context):
+    """Draw feedback during modal stagger operation."""
+    if operator._last_applied_delta is None:
+        return
+    
+    x = operator._draw_mouse_x
+    y = operator._draw_mouse_y
+    
+    delta = int(operator._last_applied_delta)
+    groups = len(operator._groups) if operator._groups else 0
+    mode = operator._order_mode
+    
+    mode_icons = {"NORMAL": "▼", "REVERSE": "▲", "RANDOM": "◆"}
+    mode_icon = mode_icons.get(mode, "")
+    
+    text = f"{mode_icon} {delta:+d}f × {groups}"
+    
+    if mode == "RANDOM":
+        subtext = f"seed {operator._random_seed} (scroll)"
+    else:
+        subtext = None
+    
     font_id = 0
-    blf.size(font_id, 18)
-    blf.color(font_id, 1.0, 1.0, 1.0, 1.0)
+    blf.size(font_id, 14)
+    dim1 = blf.dimensions(font_id, text)
     
-    # Draw background shadow for better readability
-    blf.enable(font_id, blf.SHADOW)
-    blf.shadow(font_id, 5, 0.0, 0.0, 0.0, 0.8)
-    blf.shadow_offset(font_id, 1, -1)
+    padding = 8
+    box_x = x + 22
     
-    # Draw the text
-    delta = int(self._last_applied_delta)
-    text = f"Stagger: {delta:+d} frames" if delta != 0 else "Stagger: 0 frames"
-    blf.position(font_id, x + 25, y + 15, 0)
-    blf.draw(font_id, text)
+    gpu.state.blend_set('ALPHA')
+    shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+    shader.bind()
     
-    # Show number of groups
-    if self._groups:
-        group_text = f"({len(self._groups)} groups)"
-        blf.position(font_id, x + 25, y - 5, 0)
-        blf.draw(font_id, group_text)
+    if subtext:
+        blf.size(font_id, 10)
+        dim2 = blf.dimensions(font_id, subtext)
+        max_width = max(dim1[0], dim2[0])
+        total_height = dim1[1] + dim2[1] + 4
+        box_y = y - total_height / 2 - padding
+        box_width = max_width + padding * 2
+        box_height = total_height + padding * 2
+        
+        _draw_rounded_rect(shader, box_x, box_y, box_width, box_height, (0.08, 0.08, 0.08, 0.9), 5)
+        
+        blf.size(font_id, 14)
+        blf.color(font_id, 1.0, 1.0, 1.0, 1.0)
+        blf.position(font_id, box_x + padding, box_y + padding + dim2[1] + 4, 0)
+        blf.draw(font_id, text)
+        
+        blf.size(font_id, 10)
+        blf.color(font_id, 0.55, 0.55, 0.55, 1.0)
+        blf.position(font_id, box_x + padding, box_y + padding, 0)
+        blf.draw(font_id, subtext)
+    else:
+        box_y = y - dim1[1] / 2 - padding
+        box_width = dim1[0] + padding * 2
+        box_height = dim1[1] + padding * 2
+        
+        _draw_rounded_rect(shader, box_x, box_y, box_width, box_height, (0.08, 0.08, 0.08, 0.9), 5)
+        
+        blf.size(font_id, 14)
+        blf.color(font_id, 1.0, 1.0, 1.0, 1.0)
+        blf.position(font_id, box_x + padding, box_y + padding, 0)
+        blf.draw(font_id, text)
     
-    blf.disable(font_id, blf.SHADOW)
+    gpu.state.blend_set('NONE')
+
+
+# -----------------------------------------------------------------------------
+# Gizmo Hit Detection
+# -----------------------------------------------------------------------------
+
+GIZMO_HIT_RADIUS = 11
+
+
+def check_gizmo_hover(mouse_x, mouse_y):
+    """Check if mouse is hovering over a gizmo. Returns mode or None."""
+    if not state.has_selection:
+        return None
+    
+    for gx, gy, mode in state.gizmo_positions:
+        dist_sq = (mouse_x - gx) ** 2 + (mouse_y - gy) ** 2
+        if dist_sq <= GIZMO_HIT_RADIUS ** 2:
+            return mode
+    
+    return None
+
+
+# -----------------------------------------------------------------------------
+# Operators
+# -----------------------------------------------------------------------------
+
+class EZSTAGGER_OT_hover(Operator):
+    """Update cursor and hover state when moving over gizmos"""
+    bl_idname = "anim.ez_stagger_hover"
+    bl_label = "EZ Stagger Hover"
+    bl_options = {'INTERNAL'}
+    
+    def invoke(self, context, event):
+        if not state.enabled or context.region is None:
+            return {'PASS_THROUGH'}
+        
+        mouse_x = event.mouse_region_x
+        mouse_y = event.mouse_region_y
+        
+        # Check bounds
+        if not (0 <= mouse_x <= context.region.width and
+                0 <= mouse_y <= context.region.height):
+            if state.hovered:
+                state.hovered = None
+                context.area.tag_redraw()
+            return {'PASS_THROUGH'}
+        
+        old_hovered = state.hovered
+        state.hovered = check_gizmo_hover(mouse_x, mouse_y)
+        
+        # Handle scroll for random seed
+        if state.hovered == "RANDOM":
+            if event.type == 'WHEELUPMOUSE':
+                state.random_seed += 1
+                context.area.tag_redraw()
+            elif event.type == 'WHEELDOWNMOUSE':
+                state.random_seed -= 1
+                context.area.tag_redraw()
+        
+        # Update cursor
+        if state.hovered:
+            context.window.cursor_set('HAND')
+        else:
+            context.window.cursor_set('DEFAULT')
+        
+        # Redraw if hover changed
+        if old_hovered != state.hovered:
+            context.area.tag_redraw()
+        
+        return {'PASS_THROUGH'}
+
+
+class EZSTAGGER_OT_gizmo_click(Operator):
+    """Click on a stagger gizmo to start staggering"""
+    bl_idname = "anim.ez_stagger_gizmo_click"
+    bl_label = "EZ Stagger Click"
+    bl_options = {'INTERNAL'}
+    
+    def invoke(self, context, event):
+        if not state.enabled or not state.has_selection:
+            return {'PASS_THROUGH'}
+        
+        mouse_x = event.mouse_region_x
+        mouse_y = event.mouse_region_y
+        
+        clicked_mode = check_gizmo_hover(mouse_x, mouse_y)
+        
+        if clicked_mode:
+            # Start the stagger modal with the clicked mode
+            bpy.ops.anim.ez_stagger_modal(
+                'INVOKE_DEFAULT',
+                order_mode=clicked_mode,
+                random_seed=state.random_seed
+            )
+            return {'FINISHED'}
+        
+        return {'PASS_THROUGH'}
 
 
 class EZSTAGGER_OT_stagger_modal(Operator):
     bl_idname = "anim.ez_stagger_modal"
     bl_label = "EZ Stagger Offset"
-    bl_description = "Alt-drag to offset selected keyframes with a stagger by channel"
+    bl_description = "Drag to offset selected keyframes with a stagger by channel"
     bl_options = {"REGISTER", "UNDO", "GRAB_CURSOR", "BLOCKING"}
 
-    invert_grouping: BoolProperty(
-        name="Invert Grouping",
-        description="If true, swap grouping mode: per owner vs per fcurve",
-        default=False,
-        options=set(),
+    order_mode: EnumProperty(
+        name="Order Mode",
+        items=(
+            ("NORMAL", "Normal", "First selected → last"),
+            ("REVERSE", "Reverse", "Last selected → first"),
+            ("RANDOM", "Random", "Random order"),
+        ),
+        default="NORMAL",
     )
+    
+    random_seed: IntProperty(name="Random Seed", default=42)
+    invert_grouping: BoolProperty(name="Invert Grouping", default=False, options=set())
 
-    use_time_order: BoolProperty(
-        name="Use Time Order",
-        description="If true, order channels by earliest selected keyframe time",
-        default=False,
-        options=set(),
-    )
-
-    # Internal runtime state
-    _initial_mouse_region_x: int | None = None
+    # Internal state
     _initial_time: float | None = None
     _region: object | None = None
-    _owners_by_action: dict | None = None
     _groups: list | None = None
+    _groups_original: list | None = None
     _group_items: dict | None = None
     _fcurves_to_update: set | None = None
     _last_applied_delta: float | None = None
     _draw_handler: object | None = None
     _draw_mouse_x: int = 0
     _draw_mouse_y: int = 0
+    _order_mode: str = "NORMAL"
+    _random_seed: int = 42
 
     def invoke(self, context, event):
-        # Start only in Dope Sheet editor
         area = context.area
         if not area or area.type != 'DOPESHEET_EDITOR':
-            self.report({'WARNING'}, "EZ Stagger works in Dope Sheet / Action Editor")
+            self.report({'WARNING'}, "Works in Dope Sheet / Action Editor")
             return {'CANCELLED'}
 
-        # Modifier toggles at invoke
         self.invert_grouping = event.shift
-        self.use_time_order = event.ctrl
+        self._order_mode = self.order_mode
+        self._random_seed = self.random_seed
 
-        # Capture selection snapshot and prepare groups
         ok = self._prepare_groups(context)
         if not ok:
-            self.report({'WARNING'}, "No selected keyframes found")
+            self.report({'WARNING'}, "No selected keyframes")
             return {'CANCELLED'}
 
-        # Setup mouse/time reference
         region = context.region
-        if not region or getattr(region, 'type', '') != 'WINDOW':
-            self.report({'WARNING'}, "Start the drag in the Dope Sheet main area")
+        if not region:
             return {'CANCELLED'}
+        
         v2d = region.view2d
-        self._initial_mouse_region_x = event.mouse_region_x
-        # Convert region x to time (frames)
         x_view, _ = v2d.region_to_view(event.mouse_region_x, event.mouse_region_y)
         self._initial_time = x_view
         self._region = region
@@ -259,194 +625,163 @@ class EZSTAGGER_OT_stagger_modal(Operator):
         self._draw_mouse_x = event.mouse_region_x
         self._draw_mouse_y = event.mouse_region_y
 
-        # Add draw handler for visual feedback
         self._draw_handler = bpy.types.SpaceDopeSheetEditor.draw_handler_add(
-            _draw_stagger_callback, (self, context), 'WINDOW', 'POST_PIXEL'
+            _draw_stagger_feedback, (self, context), 'WINDOW', 'POST_PIXEL'
         )
 
         context.window_manager.modal_handler_add(self)
         return {'RUNNING_MODAL'}
 
     def modal(self, context, event):
-        # Update mouse position for drawing
         self._draw_mouse_x = event.mouse_region_x
         self._draw_mouse_y = event.mouse_region_y
 
         if event.type in {'ESC', 'RIGHTMOUSE'}:
-            # Revert
             self._apply_offset(0.0)
             self._finalize_updates()
             self._remove_draw_handler()
             return {'CANCELLED'}
 
+        # Scroll changes random seed
+        if self._order_mode == "RANDOM":
+            if event.type == 'WHEELUPMOUSE':
+                self._random_seed += 1
+                self._reorder_groups_random()
+                self._apply_offset(self._last_applied_delta or 0)
+                context.area.tag_redraw()
+                return {'RUNNING_MODAL'}
+            if event.type == 'WHEELDOWNMOUSE':
+                self._random_seed -= 1
+                self._reorder_groups_random()
+                self._apply_offset(self._last_applied_delta or 0)
+                context.area.tag_redraw()
+                return {'RUNNING_MODAL'}
+
         if event.type == 'MOUSEMOVE':
-            # Compute integer frame delta from initial view x
             region = self._region or context.region
-            v2d = region.view2d if region else context.region.view2d
+            v2d = region.view2d
             x_view, _ = v2d.region_to_view(event.mouse_region_x, event.mouse_region_y)
             delta_frames = round(x_view - (self._initial_time or 0.0))
             if self._last_applied_delta != delta_frames:
                 self._apply_offset(delta_frames)
-                self._tag_redraw(context)
+                context.area.tag_redraw()
                 self._last_applied_delta = delta_frames
             return {'RUNNING_MODAL'}
 
         if event.type in {'LEFTMOUSE', 'RET', 'NUMPAD_ENTER'} and event.value == 'RELEASE':
-            # Confirm current state
             self._finalize_updates()
             self._remove_draw_handler()
+            state.random_seed = self._random_seed
             return {'FINISHED'}
 
         return {'RUNNING_MODAL'}
 
     def _remove_draw_handler(self):
-        """Remove the draw handler if it exists."""
-        if self._draw_handler is not None:
+        if self._draw_handler:
             bpy.types.SpaceDopeSheetEditor.draw_handler_remove(self._draw_handler, 'WINDOW')
             self._draw_handler = None
 
     def _prepare_groups(self, context) -> bool:
-        """Scan all selected keyframe points and build grouping structures.
-
-        Stores:
-        - _groups: list of channel keys in the computed order
-        - _group_items: mapping channel key -> list of KeyframeItem
-        - _fcurves_to_update: set of fcurves to call update() on after edits
-        - _owners_by_action: mapping Action -> Object owner
-        """
-        # Snapshot owners mapping
-        self._owners_by_action = _action_owners_map()
-
-        # Collect all selected keyframes across relevant Actions/FCurves
+        """Build groups ordered by first selected keyframe time per channel."""
+        owners_map = _action_owners_map()
+        
         KeyItem = _KeyItem
-        selected_items: list[KeyItem] = []
-
+        selected_items = []
+        channel_first_time = {}
+        
         for act in _gather_relevant_actions(context):
             fcurves = _get_fcurves_from_action(act)
             if not fcurves:
                 continue
-            owner = self._owners_by_action.get(act)
+            owner = owners_map.get(act)
             for fc in fcurves:
-                # Skip invisible/muted? Keep it simple: operate purely on selection flags
                 for kp in fc.keyframe_points:
                     if getattr(kp, "select_control_point", False):
                         selected_items.append(KeyItem(owner, act, fc, kp))
-
+                        key = (id(act), id(fc))
+                        frame = kp.co.x
+                        if key not in channel_first_time or frame < channel_first_time[key]:
+                            channel_first_time[key] = frame
+        
         if not selected_items:
             return False
-
-        # Decide grouping mode
-        prefs = _prefs()
+        
+        # Grouping mode
         group_per_fcurve = True
-        if prefs.auto_grouping:
-            # Prefer per-owner/bone unless a channel header is explicitly selected
-            any_channel_header_selected = any(getattr(it.fcurve, 'select', False) for it in selected_items)
-            group_per_fcurve = any_channel_header_selected
-            if self.invert_grouping:
-                group_per_fcurve = not group_per_fcurve
-        else:
-            # Default to per-fcurve unless inverted
-            group_per_fcurve = not self.invert_grouping
-
-        # Group items
-        group_items: dict = {}
-        fcurves_to_update: set = set()
-
+        any_header_selected = any(getattr(it.fcurve, 'select', False) for it in selected_items)
+        group_per_fcurve = any_header_selected
+        if self.invert_grouping:
+            group_per_fcurve = not group_per_fcurve
+        
+        group_items = {}
+        fcurves_to_update = set()
+        
         for it in selected_items:
             fcurves_to_update.add(it.fcurve)
             chan_key = it.channel_key_per_fcurve() if group_per_fcurve else it.channel_key_per_owner()
             if chan_key not in group_items:
                 group_items[chan_key] = []
             group_items[chan_key].append(it)
-
-        # Determine ordering of channels
-        order_mode = self._resolve_order_mode()
-        if order_mode == 'TIME':
-            # Earliest selected key per channel
-            def earliest_time(items: list[KeyItem]) -> float:
-                return min(k.orig_co_x for k in items)
-            groups_sorted = sorted(group_items.keys(), key=lambda k: earliest_time(group_items[k]))
-        else:
-            # Default: selection order of objects in viewport, fallback to Outliner index
-            sel_rank = _build_selection_order_map(context)
-            outline_rank = _build_outliner_order_map(context)
-
-            def group_sort_key(k):
-                items = group_items[k]
-                ref = items[0]
-                obj = ref.owner_obj
-                sr = sel_rank.get(obj, 10**9)
-                orank = outline_rank.get(obj, 10**9)
-                return (
-                    sr,
-                    orank,
-                    ref.owner_name or "",
-                    ref.bone_name or "",
-                    ref.data_path or "",
-                    ref.array_index if ref.array_index is not None else -1,
-                )
-
-            groups_sorted = sorted(group_items.keys(), key=group_sort_key)
-
+        
+        # Sort by earliest selected time
+        def sort_key(chan_key):
+            items = group_items[chan_key]
+            return min(it.orig_co_x for it in items)
+        
+        groups_sorted = sorted(group_items.keys(), key=sort_key)
+        self._groups_original = list(groups_sorted)
+        
+        if self._order_mode == "REVERSE":
+            groups_sorted = list(reversed(groups_sorted))
+        elif self._order_mode == "RANDOM":
+            rng = random.Random(self._random_seed)
+            groups_sorted = list(groups_sorted)
+            rng.shuffle(groups_sorted)
+        
         self._groups = groups_sorted
         self._group_items = group_items
         self._fcurves_to_update = fcurves_to_update
         return True
 
-    def _resolve_order_mode(self) -> str:
-        prefs = _prefs()
-        if self.use_time_order:
-            # Ctrl toggles to TIME ordering during this run
-            return 'TIME'
-        return prefs.order_mode
+    def _reorder_groups_random(self):
+        if self._groups_original:
+            rng = random.Random(self._random_seed)
+            self._groups = list(self._groups_original)
+            rng.shuffle(self._groups)
 
-    def _apply_offset(self, delta_frames: float) -> None:
-        """Apply staggered offsets based on current delta_frames.
-
-        The first group (anchor) gets 0 offset, second gets 1*delta, etc.
-        """
+    def _apply_offset(self, delta_frames: float):
         if not self._groups or not self._group_items:
             return
         for idx, gkey in enumerate(self._groups):
             group_offset = idx * delta_frames
-            items = self._group_items[gkey]
-            for it in items:
+            for it in self._group_items[gkey]:
                 it.apply_offset(group_offset)
 
-    def _tag_redraw(self, context) -> None:
-        area = context.area
-        if area:
-            area.tag_redraw()
-
-    def _finalize_updates(self) -> None:
-        # Recalculate fcurves once at the end to avoid heavy updates during drag
+    def _finalize_updates(self):
         if not self._fcurves_to_update:
             return
         for fc in self._fcurves_to_update:
             try:
                 fc.update()
-            except Exception:
+            except:
                 pass
 
 
-class _KeyItem:
-    """Snapshot of a selected keyframe point with minimal context and original values."""
+# -----------------------------------------------------------------------------
+# Key Item Class
+# -----------------------------------------------------------------------------
 
+class _KeyItem:
     def __init__(self, owner_obj, action, fcurve, keyframe_point):
-        self.owner_obj = owner_obj  # may be None
+        self.owner_obj = owner_obj
         self.action = action
         self.fcurve = fcurve
         self.kp = keyframe_point
 
-        # Original coordinates for restore and incremental updates
         self.orig_co_x = float(keyframe_point.co.x)
-        self.orig_co_y = float(keyframe_point.co.y)
         self.orig_hl_x = float(keyframe_point.handle_left.x)
-        self.orig_hl_y = float(keyframe_point.handle_left.y)
         self.orig_hr_x = float(keyframe_point.handle_right.x)
-        self.orig_hr_y = float(keyframe_point.handle_right.y)
 
-        # Pre-parse bone name and details for grouping keys
         self.data_path = fcurve.data_path
         self.array_index = fcurve.array_index
         self.bone_name = _parse_bone_name_from_datapath(self.data_path)
@@ -456,140 +791,109 @@ class _KeyItem:
         return (self.owner_name, self.bone_name, self.data_path, self.array_index)
 
     def channel_key_per_owner(self):
-        # Collapse datapath dimension; treat owner+bone as the channel
         return (self.owner_name, self.bone_name, None, None)
 
     def apply_offset(self, offset_x: float):
-        new_x = self.orig_co_x + offset_x
-        dx = new_x - self.kp.co.x
-        # Set control point
-        self.kp.co.x = new_x
-        # Shift handles horizontally by the same absolute delta from original
-        # Keep vertical values unchanged
+        self.kp.co.x = self.orig_co_x + offset_x
         self.kp.handle_left.x = self.orig_hl_x + offset_x
         self.kp.handle_right.x = self.orig_hr_x + offset_x
 
 
-def _prefs() -> EZSTAGGER_Preferences:
-    addon_prefs = bpy.context.preferences.addons.get("ezstagger")
-    if addon_prefs is None:
-        # Fallback with defaults
-        return EZSTAGGER_Preferences()
-    return addon_prefs.preferences
+# -----------------------------------------------------------------------------
+# Preferences
+# -----------------------------------------------------------------------------
+
+class EZSTAGGER_Preferences(AddonPreferences):
+    bl_idname = __package__
+
+    def draw(self, context):
+        layout = self.layout
+        layout.label(text="EZ Stagger Offset")
+        layout.label(text="Select keyframes in Dope Sheet, then click on the gizmos or Alt+Click to stagger.")
 
 
-def _build_selection_order_map(context) -> dict:
-    """Map objects to ranks using live selection history; fallback to current selected order.
-
-    The most recently active object gets the highest priority (largest index in history),
-    but we map to increasing rank (0 is first) preserving history order.
-    """
-    mapping = {}
-    # Use selection history if available
-    if SELECTION_HISTORY:
-        for i, name in enumerate(SELECTION_HISTORY):
-            obj = bpy.data.objects.get(name)
-            if obj is not None and obj not in mapping:
-                mapping[obj] = i
-    # Fallback to current selected objects order
-    if not mapping and getattr(context, 'selected_objects', None):
-        for i, obj in enumerate(context.selected_objects):
-            mapping[obj] = i
-    return mapping
-
-
-def _build_outliner_order_map(context) -> dict:
-    """Map objects to a stable index following the View Layer Outliner order.
-
-    We traverse the layer_collection tree depth-first and enumerate collection.objects
-    in their stored order, matching the Outliner order as closely as possible.
-    """
-    mapping = {}
-    counter = [0]
-
-    def visit_layer(layer):
-        col = layer.collection
-        for obj in col.objects:
-            if obj not in mapping:
-                mapping[obj] = counter[0]
-                counter[0] += 1
-        for child in layer.children:
-            visit_layer(child)
-
-    view_layer = context.view_layer if getattr(context, 'view_layer', None) else None
-    if view_layer:
-        visit_layer(view_layer.layer_collection)
-    else:
-        # Fallback to scene collection
-        root = context.scene.collection if getattr(context, 'scene', None) else None
-        if root:
-            for obj in root.all_objects:
-                mapping[obj] = counter[0]
-                counter[0] += 1
-    return mapping
-
+# -----------------------------------------------------------------------------
+# Registration
+# -----------------------------------------------------------------------------
 
 classes = (
     EZSTAGGER_Preferences,
     EZSTAGGER_OT_stagger_modal,
+    EZSTAGGER_OT_gizmo_click,
+    EZSTAGGER_OT_hover,
 )
 
 
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
-
-    # Keymap: Dope Sheet editor, Alt+LeftMouse (Press) starts modal operator
+    
+    # Register draw handler
+    handler = bpy.types.SpaceDopeSheetEditor.draw_handler_add(
+        draw_stagger_gizmos, (), 'WINDOW', 'POST_PIXEL'
+    )
+    state.draw_handlers['SpaceDopeSheetEditor'] = (bpy.types.SpaceDopeSheetEditor, handler)
+    
+    # Keymaps
     wm = bpy.context.window_manager
     kc = wm.keyconfigs.addon
     if kc:
-        km = kc.keymaps.new(name="Dopesheet", space_type='DOPESHEET_EDITOR')
-        kmi = km.keymap_items.new(EZSTAGGER_OT_stagger_modal.bl_idname, type='LEFTMOUSE', value='PRESS', alt=True)
-        ADDON_KEYMAP_ITEMS.append((km, kmi))
-
-    # Subscribe to active object changes to record selection history
-    try:
-        bpy.msgbus.subscribe_rna(
-            key=(bpy.types.LayerObjects, "active"),
-            owner=MSGBUS_OWNER,
-            args=(),
-            notify=lambda: _on_active_object_change(),
+        km = kc.keymaps.new(name='Dopesheet', space_type='DOPESHEET_EDITOR')
+        
+        # Alt+Click for direct stagger
+        kmi = km.keymap_items.new(
+            EZSTAGGER_OT_stagger_modal.bl_idname,
+            type='LEFTMOUSE', value='PRESS', alt=True
         )
-    except Exception:
-        # Fallback for API changes
-        try:
-            bpy.msgbus.subscribe_rna(
-                key=(bpy.types.ViewLayer, "objects.active"),
-                owner=MSGBUS_OWNER,
-                args=(),
-                notify=lambda: _on_active_object_change(),
-            )
-        except Exception:
-            pass
+        addon_keymaps.append((km, kmi))
+        
+        # Click on gizmo
+        kmi = km.keymap_items.new(
+            EZSTAGGER_OT_gizmo_click.bl_idname,
+            type='LEFTMOUSE', value='PRESS'
+        )
+        addon_keymaps.append((km, kmi))
+        
+        # Hover detection
+        kmi = km.keymap_items.new(
+            EZSTAGGER_OT_hover.bl_idname,
+            type='MOUSEMOVE', value='ANY'
+        )
+        addon_keymaps.append((km, kmi))
+        
+        # Scroll for random seed
+        kmi = km.keymap_items.new(
+            EZSTAGGER_OT_hover.bl_idname,
+            type='WHEELUPMOUSE', value='PRESS'
+        )
+        addon_keymaps.append((km, kmi))
+        kmi = km.keymap_items.new(
+            EZSTAGGER_OT_hover.bl_idname,
+            type='WHEELDOWNMOUSE', value='PRESS'
+        )
+        addon_keymaps.append((km, kmi))
 
 
 def unregister():
     # Remove keymaps
-    wm = bpy.context.window_manager
-    kc = wm.keyconfigs.addon
-    if kc:
-        for km, kmi in ADDON_KEYMAP_ITEMS:
-            try:
-                km.keymap_items.remove(kmi)
-            except Exception:
-                pass
-        ADDON_KEYMAP_ITEMS.clear()
-
+    for km, kmi in addon_keymaps:
+        try:
+            km.keymap_items.remove(kmi)
+        except:
+            pass
+    addon_keymaps.clear()
+    
+    # Remove draw handlers
+    for space_name, (space_type, handler) in state.draw_handlers.items():
+        try:
+            space_type.draw_handler_remove(handler, 'WINDOW')
+        except:
+            pass
+    state.draw_handlers.clear()
+    
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
-
-    # Unsubscribe msgbus
-    try:
-        bpy.msgbus.clear_by_owner(MSGBUS_OWNER)
-    except Exception:
-        pass
 
 
 if __name__ == "__main__":
     register()
-
