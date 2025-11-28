@@ -1,0 +1,17 @@
+schema_version = "1.0.0"
+id = "ezstagger"
+version = "1.0.0"
+name = "EZ Stagger Offset"
+tagline = "Alt-drag to apply staggered per-channel frame offsets to selected keyframes"
+maintainer = "EZStagger Team"
+type = "add-on"
+
+blender_version_min = "5.0.0"
+
+license = [
+    "SPDX:GPL-3.0-or-later",
+]
+
+[permissions]
+# No special permissions required
+

@@ -1,17 +1,7 @@
-bl_info = {
-    "name": "EZ Stagger Offset",
-    "author": "EZStagger Team",
-    "version": (1, 0, 0),
-    "blender": (4, 5, 0),
-    "location": "Dope Sheet / Action Editor",
-    "description": "Alt-drag to apply staggered per-channel frame offsets to selected keyframes",
-    "warning": "",
-    "doc_url": "",
-    "category": "Animation",
-}
+"""EZ Stagger Offset - Alt-drag to apply staggered per-channel frame offsets."""
 
 import bpy
-import re
+import blf
 from bpy.types import Operator, AddonPreferences
 from bpy.props import BoolProperty, EnumProperty
 
@@ -34,6 +24,28 @@ def _parse_bone_name_from_datapath(data_path: str) -> str | None:
     if end == -1:
         return None
     return data_path[start:end]
+
+
+def _get_fcurves_from_action(action):
+    """Get all fcurves from action (Blender 5.0+ slotted actions API).
+    
+    In Blender 5.0+, fcurves are accessed through layers/strips/channelbags
+    instead of directly from the Action object.
+    """
+    fcurves = []
+    if not hasattr(action, 'layers') or not action.layers:
+        return fcurves
+    for layer in action.layers:
+        if not hasattr(layer, 'strips') or not layer.strips:
+            continue
+        for strip in layer.strips:
+            if not hasattr(action, 'slots'):
+                continue
+            for slot in action.slots:
+                channelbag = strip.channelbag(slot)
+                if channelbag and hasattr(channelbag, 'fcurves') and channelbag.fcurves:
+                    fcurves.extend(channelbag.fcurves)
+    return fcurves
 
 
 def _action_owners_map() -> dict:
@@ -120,7 +132,7 @@ def _on_active_object_change():
 
 
 class EZSTAGGER_Preferences(AddonPreferences):
-    bl_idname = __name__
+    bl_idname = "ezstagger"
 
     order_mode: EnumProperty(
         name="Default Order",
@@ -146,6 +158,40 @@ class EZSTAGGER_Preferences(AddonPreferences):
         layout.label(text="EZ Stagger Offset")
         layout.prop(self, "order_mode")
         layout.prop(self, "auto_grouping")
+
+
+def _draw_stagger_callback(self, context):
+    """Draw callback to show stagger offset feedback during modal operation."""
+    if self._last_applied_delta is None:
+        return
+    
+    # Get mouse position for drawing near cursor
+    x = self._draw_mouse_x
+    y = self._draw_mouse_y
+    
+    # Configure text
+    font_id = 0
+    blf.size(font_id, 18)
+    blf.color(font_id, 1.0, 1.0, 1.0, 1.0)
+    
+    # Draw background shadow for better readability
+    blf.enable(font_id, blf.SHADOW)
+    blf.shadow(font_id, 5, 0.0, 0.0, 0.0, 0.8)
+    blf.shadow_offset(font_id, 1, -1)
+    
+    # Draw the text
+    delta = int(self._last_applied_delta)
+    text = f"Stagger: {delta:+d} frames" if delta != 0 else "Stagger: 0 frames"
+    blf.position(font_id, x + 25, y + 15, 0)
+    blf.draw(font_id, text)
+    
+    # Show number of groups
+    if self._groups:
+        group_text = f"({len(self._groups)} groups)"
+        blf.position(font_id, x + 25, y - 5, 0)
+        blf.draw(font_id, group_text)
+    
+    blf.disable(font_id, blf.SHADOW)
 
 
 class EZSTAGGER_OT_stagger_modal(Operator):
@@ -177,6 +223,9 @@ class EZSTAGGER_OT_stagger_modal(Operator):
     _group_items: dict | None = None
     _fcurves_to_update: set | None = None
     _last_applied_delta: float | None = None
+    _draw_handler: object | None = None
+    _draw_mouse_x: int = 0
+    _draw_mouse_y: int = 0
 
     def invoke(self, context, event):
         # Start only in Dope Sheet editor
@@ -206,16 +255,28 @@ class EZSTAGGER_OT_stagger_modal(Operator):
         x_view, _ = v2d.region_to_view(event.mouse_region_x, event.mouse_region_y)
         self._initial_time = x_view
         self._region = region
-        self._last_applied_delta = None
+        self._last_applied_delta = 0
+        self._draw_mouse_x = event.mouse_region_x
+        self._draw_mouse_y = event.mouse_region_y
+
+        # Add draw handler for visual feedback
+        self._draw_handler = bpy.types.SpaceDopeSheetEditor.draw_handler_add(
+            _draw_stagger_callback, (self, context), 'WINDOW', 'POST_PIXEL'
+        )
 
         context.window_manager.modal_handler_add(self)
         return {'RUNNING_MODAL'}
 
     def modal(self, context, event):
+        # Update mouse position for drawing
+        self._draw_mouse_x = event.mouse_region_x
+        self._draw_mouse_y = event.mouse_region_y
+
         if event.type in {'ESC', 'RIGHTMOUSE'}:
             # Revert
             self._apply_offset(0.0)
             self._finalize_updates()
+            self._remove_draw_handler()
             return {'CANCELLED'}
 
         if event.type == 'MOUSEMOVE':
@@ -233,9 +294,16 @@ class EZSTAGGER_OT_stagger_modal(Operator):
         if event.type in {'LEFTMOUSE', 'RET', 'NUMPAD_ENTER'} and event.value == 'RELEASE':
             # Confirm current state
             self._finalize_updates()
+            self._remove_draw_handler()
             return {'FINISHED'}
 
         return {'RUNNING_MODAL'}
+
+    def _remove_draw_handler(self):
+        """Remove the draw handler if it exists."""
+        if self._draw_handler is not None:
+            bpy.types.SpaceDopeSheetEditor.draw_handler_remove(self._draw_handler, 'WINDOW')
+            self._draw_handler = None
 
     def _prepare_groups(self, context) -> bool:
         """Scan all selected keyframe points and build grouping structures.
@@ -254,10 +322,11 @@ class EZSTAGGER_OT_stagger_modal(Operator):
         selected_items: list[KeyItem] = []
 
         for act in _gather_relevant_actions(context):
-            if not act.fcurves:
+            fcurves = _get_fcurves_from_action(act)
+            if not fcurves:
                 continue
             owner = self._owners_by_action.get(act)
-            for fc in act.fcurves:
+            for fc in fcurves:
                 # Skip invisible/muted? Keep it simple: operate purely on selection flags
                 for kp in fc.keyframe_points:
                     if getattr(kp, "select_control_point", False):
@@ -402,7 +471,7 @@ class _KeyItem:
 
 
 def _prefs() -> EZSTAGGER_Preferences:
-    addon_prefs = bpy.context.preferences.addons.get(__name__)
+    addon_prefs = bpy.context.preferences.addons.get("ezstagger")
     if addon_prefs is None:
         # Fallback with defaults
         return EZSTAGGER_Preferences()
@@ -523,5 +592,4 @@ def unregister():
 
 if __name__ == "__main__":
     register()
-
 
