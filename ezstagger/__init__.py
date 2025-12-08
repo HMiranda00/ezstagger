@@ -60,25 +60,48 @@ def _parse_bone_name(data_path: str) -> str | None:
     return data_path[start:end]
 
 
-def _get_fcurves_from_action(action):
-    """Get fcurves from action (Blender 5.0+ slotted actions API)."""
+def _get_fcurves_from_action(action, slot=None):
+    """
+    Get fcurves from action (Blender 5.0+ slotted actions API).
+    
+    Args:
+        action: The action to get fcurves from
+        slot: Optional specific slot to use. If None, searches all slots.
+    """
     fcurves = []
     if not hasattr(action, 'layers') or not action.layers:
         return fcurves
+    
     for layer in action.layers:
         if not hasattr(layer, 'strips') or not layer.strips:
             continue
         for strip in layer.strips:
             if not hasattr(action, 'slots'):
                 continue
-            for slot in action.slots:
+            
+            # If a specific slot is provided, only use that one
+            slots_to_check = [slot] if slot else action.slots
+            
+            for s in slots_to_check:
+                if s is None:
+                    continue
                 try:
-                    channelbag = strip.channelbag(slot)
+                    channelbag = strip.channelbag(s)
                     if channelbag and hasattr(channelbag, 'fcurves') and channelbag.fcurves:
                         fcurves.extend(channelbag.fcurves)
                 except:
                     pass
     return fcurves
+
+
+def _get_object_slot(obj):
+    """Get the action slot for an object (Blender 5.0+)."""
+    ad = obj.animation_data
+    if not ad:
+        return None
+    if hasattr(ad, 'action_slot'):
+        return ad.action_slot
+    return None
 
 
 def _collect_selected_keyframes():
@@ -94,7 +117,10 @@ def _collect_selected_keyframes():
             if not ad or not ad.action:
                 continue
             
-            fcurves = _get_fcurves_from_action(ad.action)
+            # Get the object's specific slot (Blender 5.0+)
+            slot = _get_object_slot(obj)
+            fcurves = _get_fcurves_from_action(ad.action, slot)
+            
             for fc in fcurves:
                 bone_name = _parse_bone_name(fc.data_path)
                 
@@ -116,6 +142,7 @@ def _collect_selected_keyframes():
                             'hl_type': kp.handle_left_type,
                             'hr_type': kp.handle_right_type,
                         })
+                        
     except Exception as e:
         print(f"EZStagger: Error collecting keyframes: {e}")
     
@@ -130,9 +157,10 @@ def _get_fcurve_and_keypoint(obj_name, action_name, data_path, array_index, kp_i
             return None, None
         
         act = obj.animation_data.action
-        # Don't check action name - it might have changed
+        # Get the object's specific slot (Blender 5.0+)
+        slot = _get_object_slot(obj)
         
-        fcurves = _get_fcurves_from_action(act)
+        fcurves = _get_fcurves_from_action(act, slot)
         for fc in fcurves:
             if fc.data_path == data_path and fc.array_index == array_index:
                 if 0 <= kp_index < len(fc.keyframe_points):
@@ -158,7 +186,10 @@ def _calculate_current_ease():
             if not ad or not ad.action:
                 continue
             
-            fcurves = _get_fcurves_from_action(ad.action)
+            # Get the object's specific slot (Blender 5.0+)
+            slot = _get_object_slot(obj)
+            fcurves = _get_fcurves_from_action(ad.action, slot)
+            
             for fc in fcurves:
                 kps = fc.keyframe_points
                 for i, kp in enumerate(kps):
@@ -548,6 +579,27 @@ def check_ease(mx, my):
 # Operators
 # -----------------------------------------------------------------------------
 
+class EZSTAGGER_OT_debug(Operator):
+    """Debug: Print selected keyframes info to console"""
+    bl_idname = "anim.ez_stagger_debug"
+    bl_label = "EZ Stagger Debug"
+    
+    def execute(self, context):
+        selected = _collect_selected_keyframes()
+        groups = _determine_grouping(selected)
+        
+        bones = set(it['bone_name'] for it in selected if it['bone_name'])
+        print(f"\nEZStagger: {len(selected)} keyframes, {len(groups)} groups, {len(bones)} bones")
+        for i, grp in enumerate(groups[:10]):  # Show first 10 groups only
+            bone = next((it['bone_name'] for it in grp if it['bone_name']), 'N/A')
+            print(f"  Group {i}: {len(grp)} kps, bone={bone}")
+        if len(groups) > 10:
+            print(f"  ... and {len(groups) - 10} more groups")
+        
+        self.report({'INFO'}, f"{len(selected)} keyframes, {len(groups)} groups")
+        return {'FINISHED'}
+
+
 class EZSTAGGER_OT_hover(Operator):
     bl_idname = "anim.ez_stagger_hover"
     bl_label = "Hover"
@@ -878,7 +930,7 @@ class EZSTAGGER_Prefs(AddonPreferences):
         self.layout.label(text="EZ Stagger - Select keyframes to see widgets")
 
 
-classes = (EZSTAGGER_Prefs, EZSTAGGER_OT_stagger, EZSTAGGER_OT_ease, EZSTAGGER_OT_click, EZSTAGGER_OT_hover)
+classes = (EZSTAGGER_Prefs, EZSTAGGER_OT_stagger, EZSTAGGER_OT_ease, EZSTAGGER_OT_click, EZSTAGGER_OT_hover, EZSTAGGER_OT_debug)
 
 
 def register():
